@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+set -o pipefail
+
+# Stores release URLs globally to avoid constantly hitting the API server
+STENV_RELEASES=()
+
+# Default conda program is "conda"
+conda=conda
+
+# Return a list of conda environments matching $1
+have_conda_env() {
+    if ! have_conda; then
+        return 1
+    fi
+    $conda env list | sed '/^#.*/d' | cut -d ' ' -f 1 \
+        | grep "^${1}$" &>/dev/null
+}
+
+# Return a comma delimited list of environments matching "stenv"
+get_stenv() {
+    if ! have_conda; then
+        return 1
+    fi
+
+    local envs=($($conda env list | sed '/^#.*/d' | cut -d ' ' -f 1 \
+        | grep "stenv" | sort -V))
+
+    if (( ${#envs[@]} == 0)); then
+        return 1
+    fi
+
+    for (( i = 0; i < ${#envs[@]}; i++ )); do
+        echo -n "${envs[i]}"
+        if (( i < ${#envs[@]} - 1 )); then
+            echo -n ", "
+        fi
+    done
+}
+
+# Is conda available?
+# return 1 on failure
+# return 0 on success
+have_conda() {
+    type -P $conda &>/dev/null
+}
+
+# Get path to conda executable
+# return 1 and empty string if conda is not available
+# return 0 and path on success
+get_conda() {
+    if ! have_conda; then
+        return 1
+    fi
+    echo $(type -P $conda)
+    return 0
+}
+
+# Get CPU architecture
+get_arch() {
+    uname -m
+}
+
+# Convert host platform identifier to a conda-specific string
+get_conda_platform() {
+    local name=$(uname -s)
+    case "$name" in
+        Darwin)
+            echo "macOSX"
+            ;;
+        *)
+            echo "$name"
+            ;;
+    esac
+}
+
+# Convert host platform identifier to a stenv-specific string
+get_stenv_platform() {
+    local name=$(uname -s)
+    case "$name" in
+        Darwin)
+            echo "macOS"
+            ;;
+        *)
+            echo "$name"
+            ;;
+    esac
+}
+
+# Return stenv repository data (JSON)
+stenv_api() {
+    curl -s -X GET "https://api.github.com/repos/spacetelescope/stenv/$1"
+}
+
+# Extract release URLs from */stenv/releases
+get_stenv_releases() {
+    stenv_api releases \
+        | grep -Eo '"browser_download_url": "(.*)"' \
+        | while read line; do
+        sed -e 's/.*: "\(.*\)"/\1/' <<< $line
+    done
+}
+
+# Extract information from a stenv configuration file name
+# returns string:
+# name platform python_version stenv_version type
+get_stenv_components() {
+    local filename=$(basename $1)
+
+    # Handle deprecated config naming convention
+    if [[ $filename == "spacetelescope-env"* ]]; then
+        filename=${filename/spacetelescope-env/stenv}
+    fi
+    read st_name st_platform st_python_version st_version st_type \
+        <<< $(tr '-' ' ' <<< $filename | sed 's/\.yml//')
+
+    # Immortalize deprecated latest/stable/dev naming convention
+    if [[ -z "$st_type" ]]; then
+        st_type="latest"
+    fi
+
+    echo "$st_name $st_platform ${st_python_version#py} $st_version $st_type"
+}
+
+# Main entry point
+menu_main() {
+    while true; do
+        local envs
+
+        echo "STENV Assist"
+        echo "============"
+        echo
+
+        # Use mamba if its available
+        if type -P mamba &>/dev/null; then
+            conda=mamba
+        fi
+
+        /bin/echo -n "1) Install Conda  " 
+        if have_conda; then
+            echo -e "\t\t[found: $(get_conda)]"
+        else
+            echo -e "\t\t[not installed]"
+        fi
+
+        /bin/echo -n "2) Install release"
+        envs=$(get_stenv)
+        if [[ -n "$envs" ]]; then
+            echo -e "\t\t[found: $(get_stenv)]"
+        else
+            echo -e "\t\t[not installed]"
+        fi
+
+        echo "q) quit"
+        read -p "=> " choice
+        case "$choice" in
+            1)
+                if have_conda; then
+                    echo >&2
+                    echo "Conda is already installed..." >&2
+                    echo >&2
+                    continue
+                fi
+                menu_conda_install
+                ;;
+            2)
+                if ! have_conda; then
+                    echo >&2
+                    echo "Conda must be:" >&2
+                    echo "  - Available on your PATH prior to running stenv_assit" >&2
+                    echo "  - [or] Installed using option 1, 'Install Conda'" >&2
+                    echo >&2
+                    echo "To use an existing Conda installation:" >&2
+                    echo "  1. Quit stenv_assit (option: q)" >&2
+                    echo "  2. Activate your Conda base environment" >&2
+                    echo "  3. Run stenv_assit again" >&2
+                    echo >&2
+                    continue
+                fi
+                menu_create_stenv
+                ;;
+            [Qq])
+                exit 0
+                ;;
+            *)
+                echo >&2
+                echo "Invalid selection" >&2
+                echo >&2
+                ;;
+        esac
+    done
+}
+
+# Perform base conda installation
+# arguments:
+#   url: URL to remote conda installation script
+# returns status of "$conda init"
+task_conda_install() {
+    local url=$1
+    local filename=$(basename $1)
+    local root
+
+    if [[ "$filename" == "Mini"* ]]; then
+        root=$HOME/miniconda3
+    elif [[ "$filename" == "Mamba"* ]]; then
+        root=$HOME/mambaforge
+    else
+        echo "Unsupported installer: $url" >&2
+        return
+    fi
+
+    if [[ -d "$root" ]]; then
+        echo
+        echo "An existing installation was found:"
+        echo "  $root"
+        echo
+        echo "Do the following:"
+        echo "  1. Quit stenv_assist (option: q)"
+        echo "  2. Activate $root"
+        echo "     Run:"
+        echo "       source $root/etc/profile.d/conda.sh"
+        if [[ -f "$root"/etc/profile.d/mamba.sh ]]; then
+            echo "       source $root/etc/profile.d/mamba.sh"
+        fi
+        echo "       conda activate base"
+        echo "  3. Run stenv_assist again"
+        echo
+        return 0
+    fi
+
+    echo "Downloading... $url"
+    curl -L -O "$url"
+
+    echo "Installing... $filename"
+    bash "$filename" -p "$root" -b
+    rm -f "$filename"
+
+    echo "Configuring shell environment..."
+    source "$root"/etc/profile.d/conda.sh
+    if [[ -f "$root"/etc/profile.d/mamba.sh ]]; then
+        source "$root"/etc/profile.d/mamba.sh
+    fi
+    $conda init $(basename $SHELL)
+}
+
+menu_conda_install() {
+    local arch=$(get_arch)
+    local platform=$(get_conda_platform)
+    local mambaforge=https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-${platform}-${arch}.sh
+    local miniconda=https://repo.anaconda.com/miniconda/Miniconda3-latest-${platform}-${arch}.sh
+
+    echo
+    echo "Choose an installer..."
+    echo
+    echo "1) mambaforge"
+    echo "2) miniconda3"
+    echo "b) go back"
+    echo "q) quit"
+
+    while true; do
+        read -p "=> " choice
+        case "$choice" in
+            1)
+                task_conda_install $mambaforge
+                break
+                ;;
+            2)
+                task_conda_install $miniconda
+                break
+                ;;
+            b)
+                break
+                ;;
+            [qQ])
+                exit 0
+                ;;
+            *)
+                echo >&2
+                echo "Invalid selection" >&2
+                echo >&2
+                ;;
+        esac
+    done
+
+}
+
+menu_create_stenv() {
+    echo
+    echo "Choose a stenv release..."
+    echo
+    for (( i = 0; i < "${#STENV_RELEASES[@]}"; i++ )); do
+        local name="${STENV_RELEASES[i]}"
+        read st_name st_platform st_python_version st_version st_type \
+            <<< $(get_stenv_components $name)
+
+        printf "%4d) %-20s Python %-10s %-5s[%s]\n" \
+            "$i" "$st_version" "$st_python_version" " " "$st_type"
+    done
+    echo "  b) go back"
+    echo "  q) quit"
+
+    while true; do
+        local default=$(( ${#STENV_RELEASES[@]} - 1 ))
+        read -p "(default: $default) => " choice
+        if [[ -z "$choice" ]]; then
+            choice=$default
+        fi
+        case "$choice" in
+            [0-9]*)
+                if [[ "$choice" =~ [a-Z]+ ]] || (( choice < 0 )) \
+                    || (( choice > "${#STENV_RELEASES[@]}" - 1 )); then
+                    echo "Index out of range" >&2
+                    continue
+                fi
+                task_create_stenv ${STENV_RELEASES[choice]}
+                break
+                ;;
+            [bB])
+                break
+                ;;
+            [qQ])
+                exit 0
+                ;;
+            *)
+                echo >&2
+                echo "Invalid selection" >&2
+                echo >&2
+                ;;
+        esac
+    done
+}
+
+# Perform stenv conda environment creation
+# arguments:
+#  url: URL of remote stenv YAML configuration
+# returns status of "$conda env create"
+task_create_stenv() {
+    local choice
+    local name
+    local url="$1"
+    read st_name st_platform st_python_version st_version st_type \
+        <<< $(get_stenv_components $url)
+
+    name="stenv_py${st_python_version/./}"
+
+    if have_conda_env $name; then
+        echo
+        read -p "$name environment exists, do you wish to replace it ([y/N])? " choice
+        case "$choice" in
+            [yY])
+                $conda env remove --yes --name "$name"
+                # fall through to environment creation
+                ;;
+            *)
+                echo
+                return 1
+                ;;
+        esac
+    fi
+
+    echo "Using ${STENV_RELEASES[choice]}"
+    $conda env create --name "$name" --file "$url"
+}
+
+# main()
+
+# Populate release array for host system
+for x in $(get_stenv_releases | sort -V); do
+    if [[ "$x" =~ .*-"$(get_stenv_platform)-".* ]]; then
+        STENV_RELEASES+=($x)
+    fi
+done
+
+# Load the interactive menu system
+menu_main
+
