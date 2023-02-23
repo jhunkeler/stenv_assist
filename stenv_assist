@@ -357,7 +357,7 @@ task_create_stenv() {
         esac
     fi
 
-    echo "Using ${STENV_RELEASES[choice]}"
+    echo "Using $url"
     $conda env create --name "$name" --file "$url"
 }
 
